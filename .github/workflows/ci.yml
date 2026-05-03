@@ -21,3 +21,59 @@ jobs:
 
       - name: Run tests
         run: go test ./...
+
+  ts:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ts
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Type check and build
+        run: npm run check && npm run build
+
+  ui:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            ts/package-lock.json
+            ui/package-lock.json
+
+      - name: Install TS client dependencies
+        run: npm install
+        working-directory: ts
+
+      - name: Build TS client
+        run: npm run build
+        working-directory: ts
+
+      - name: Install UI dependencies
+        run: npm install
+        working-directory: ui
+
+      - name: Type check and build UI
+        run: npm run check && npm run build
+        working-directory: ui

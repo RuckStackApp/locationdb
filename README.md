@@ -14,6 +14,10 @@ Per-store records are persisted in a compact binary format and are treated as
 the service source of truth. Location indexes are durable acceleration
 structures that can be reopened or rebuilt from stored records.
 
+The service also includes an embedded admin UI. The Svelte source lives in
+`ui/`, TypeScript API bindings live in `ts/`, and the Go binary serves the
+built frontend from embedded assets.
+
 Initial scope:
 
 - multiple independently configured stores

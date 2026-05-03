@@ -57,21 +57,25 @@ type QueryLanguageRequest struct {
 }
 
 type RecordRequest struct {
-	ID        string            `json:"id"`
-	Code      string            `json:"code,omitempty"`
-	Lat       *float64          `json:"lat,omitempty"`
-	Lon       *float64          `json:"lon,omitempty"`
-	Precision *uint             `json:"precision,omitempty"`
-	Labels    []string          `json:"labels,omitempty"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
+	ID         string            `json:"id"`
+	Code       string            `json:"code,omitempty"`
+	Lat        *float64          `json:"lat,omitempty"`
+	Lon        *float64          `json:"lon,omitempty"`
+	Precision  *uint             `json:"precision,omitempty"`
+	ValidFrom  *time.Time        `json:"valid_from,omitempty"`
+	ValidUntil *time.Time        `json:"valid_until,omitempty"`
+	Labels     []string          `json:"labels,omitempty"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
 }
 
 type StoredRecord struct {
-	ID        string            `json:"id"`
-	Code      string            `json:"code"`
-	Labels    []string          `json:"labels,omitempty"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
-	CreatedAt time.Time         `json:"created_at"`
+	ID         string            `json:"id"`
+	Code       string            `json:"code"`
+	ValidFrom  *time.Time        `json:"valid_from,omitempty"`
+	ValidUntil *time.Time        `json:"valid_until,omitempty"`
+	Labels     []string          `json:"labels,omitempty"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+	CreatedAt  time.Time         `json:"created_at"`
 }
 
 type QueryPlan struct {
@@ -215,12 +219,17 @@ func (app *App) ExecuteQuery(storeName StoreName, request QueryRequest) (QueryRe
 	if limit == 0 {
 		limit = 50
 	}
+	indexLimit := limit
+	if request.ValidAt != nil {
+		indexLimit = 0
+	}
 	results := store.Index.SearchRadius(locationindex.RadiusQuery{
 		Lat:          request.Near.Lat,
 		Lon:          request.Near.Lon,
 		RadiusMeters: request.Near.Radius,
 		Precision:    locationindex.ChoosePrecision(request.Near.Radius),
-	}, locationindex.QueryOptions{Labels: labels, Limit: limit})
+	}, locationindex.QueryOptions{Labels: labels, Limit: indexLimit})
+	results = filterResultsByValidity(results, store.Records, request.ValidAt, limit)
 
 	return QueryResponse{
 		StoreName: storeName,
@@ -306,6 +315,9 @@ func (request RecordRequest) Validate() error {
 	}
 	if hasCoords && (request.Lat == nil || request.Lon == nil) {
 		return fmt.Errorf("both lat and lon are required when using coordinates")
+	}
+	if request.ValidFrom != nil && request.ValidUntil != nil && request.ValidFrom.After(*request.ValidUntil) {
+		return fmt.Errorf("valid_from must be before or equal to valid_until")
 	}
 	return nil
 }
@@ -407,11 +419,13 @@ func (app *App) InsertRecord(storeName StoreName, request RecordRequest) error {
 		code = encoded.String()
 	}
 	stored := StoredRecord{
-		ID:        request.ID,
-		Code:      code,
-		Labels:    append([]string(nil), request.Labels...),
-		Metadata:  cloneStringMap(request.Metadata),
-		CreatedAt: time.Now().UTC(),
+		ID:         request.ID,
+		Code:       code,
+		ValidFrom:  cloneTimePtr(request.ValidFrom),
+		ValidUntil: cloneTimePtr(request.ValidUntil),
+		Labels:     append([]string(nil), request.Labels...),
+		Metadata:   cloneStringMap(request.Metadata),
+		CreatedAt:  time.Now().UTC(),
 	}
 	store.Records[stored.ID] = stored
 	if err := saveRecords(store.Definition.Config, store.Records); err != nil {
@@ -506,6 +520,34 @@ func rebuildIndex(config StoreConfig, records map[string]StoredRecord) (*locatio
 	return index, nil
 }
 
+func filterResultsByValidity(results []locationindex.Result, records map[string]StoredRecord, validAt *time.Time, limit int) []locationindex.Result {
+	if validAt == nil {
+		return results
+	}
+	filtered := make([]locationindex.Result, 0, len(results))
+	for _, result := range results {
+		record, ok := records[string(result.Record.ID)]
+		if !ok || !recordValidAt(record, *validAt) {
+			continue
+		}
+		filtered = append(filtered, result)
+		if limit > 0 && len(filtered) >= limit {
+			break
+		}
+	}
+	return filtered
+}
+
+func recordValidAt(record StoredRecord, validAt time.Time) bool {
+	if record.ValidFrom != nil && validAt.Before(*record.ValidFrom) {
+		return false
+	}
+	if record.ValidUntil != nil && validAt.After(*record.ValidUntil) {
+		return false
+	}
+	return true
+}
+
 func cloneStringMap(values map[string]string) map[string]string {
 	if len(values) == 0 {
 		return nil
@@ -515,6 +557,14 @@ func cloneStringMap(values map[string]string) map[string]string {
 		out[key] = value
 	}
 	return out
+}
+
+func cloneTimePtr(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	timeCopy := value.UTC()
+	return &timeCopy
 }
 
 func saveBinaryRecords(writer io.Writer, records []StoredRecord) error {
@@ -574,6 +624,12 @@ func writeStoredRecord(writer io.Writer, record StoredRecord) error {
 	if err := writeString(writer, record.Code); err != nil {
 		return err
 	}
+	if err := writeOptionalTime(writer, record.ValidFrom); err != nil {
+		return err
+	}
+	if err := writeOptionalTime(writer, record.ValidUntil); err != nil {
+		return err
+	}
 	if err := binary.Write(writer, binary.BigEndian, int64(record.CreatedAt.UTC().UnixNano())); err != nil {
 		return err
 	}
@@ -605,6 +661,14 @@ func readStoredRecord(reader io.Reader) (StoredRecord, error) {
 		return StoredRecord{}, err
 	}
 	code, err := readString(reader)
+	if err != nil {
+		return StoredRecord{}, err
+	}
+	validFrom, err := readOptionalTime(reader)
+	if err != nil {
+		return StoredRecord{}, err
+	}
+	validUntil, err := readOptionalTime(reader)
 	if err != nil {
 		return StoredRecord{}, err
 	}
@@ -644,12 +708,43 @@ func readStoredRecord(reader io.Reader) (StoredRecord, error) {
 		metadata = nil
 	}
 	return StoredRecord{
-		ID:        id,
-		Code:      code,
-		Labels:    labels,
-		Metadata:  metadata,
-		CreatedAt: time.Unix(0, createdAtNano).UTC(),
+		ID:         id,
+		Code:       code,
+		ValidFrom:  validFrom,
+		ValidUntil: validUntil,
+		Labels:     labels,
+		Metadata:   metadata,
+		CreatedAt:  time.Unix(0, createdAtNano).UTC(),
 	}, nil
+}
+
+func writeOptionalTime(writer io.Writer, value *time.Time) error {
+	if value == nil {
+		if err := binary.Write(writer, binary.BigEndian, uint8(0)); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err := binary.Write(writer, binary.BigEndian, uint8(1)); err != nil {
+		return err
+	}
+	return binary.Write(writer, binary.BigEndian, value.UTC().UnixNano())
+}
+
+func readOptionalTime(reader io.Reader) (*time.Time, error) {
+	var present uint8
+	if err := binary.Read(reader, binary.BigEndian, &present); err != nil {
+		return nil, err
+	}
+	if present == 0 {
+		return nil, nil
+	}
+	var value int64
+	if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
+		return nil, err
+	}
+	timeValue := time.Unix(0, value).UTC()
+	return &timeValue, nil
 }
 
 func writeString(writer io.Writer, value string) error {

@@ -78,6 +78,15 @@ func TestQueryLanguageRequestValidate(t *testing.T) {
 	}
 }
 
+func TestRecordRequestValidateValidWindow(t *testing.T) {
+	from := time.Date(2026, 5, 3, 13, 0, 0, 0, time.UTC)
+	until := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	req := RecordRequest{ID: "bad", Lat: floatPtr(1), Lon: floatPtr(2), ValidFrom: &from, ValidUntil: &until}
+	if err := req.Validate(); err == nil {
+		t.Fatalf("expected validation error")
+	}
+}
+
 func TestAppCreateStoreAndReloadCatalog(t *testing.T) {
 	dataDir := t.TempDir()
 	app, err := NewApp(dataDir)
@@ -126,7 +135,7 @@ func TestHTTPStoreAndQueryEndpoints(t *testing.T) {
 		t.Fatalf("Encode() error = %v", err)
 	}
 	for _, record := range []RecordRequest{
-		{ID: "r1", Lat: floatPtr(43.6501), Lon: floatPtr(-79.3801), Precision: uintPtr(14), Labels: []string{"restaurant"}},
+		{ID: "r1", Lat: floatPtr(43.6501), Lon: floatPtr(-79.3801), Precision: uintPtr(14), Labels: []string{"restaurant"}, ValidFrom: timePtr(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))},
 		{ID: "r2", Code: codeB.String(), Labels: []string{"park"}},
 	} {
 		recordBody, err := json.Marshal(record)
@@ -180,6 +189,39 @@ func TestHTTPStoreAndQueryEndpoints(t *testing.T) {
 	}
 }
 
+func TestQueryValidAtFiltering(t *testing.T) {
+	dataDir := t.TempDir()
+	app, err := NewApp(dataDir)
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+	rootPath := filepath.Join(dataDir, "stores", "toronto")
+	if _, err := app.CreateStore(DefaultStoreConfig("toronto", rootPath)); err != nil {
+		t.Fatalf("CreateStore() error = %v", err)
+	}
+	for _, record := range []RecordRequest{
+		{ID: "old", Lat: floatPtr(43.6501), Lon: floatPtr(-79.3801), Precision: uintPtr(14), Labels: []string{"restaurant"}, ValidUntil: timePtr(time.Date(2025, 12, 31, 23, 59, 59, 0, time.UTC))},
+		{ID: "current", Lat: floatPtr(43.6502), Lon: floatPtr(-79.3802), Precision: uintPtr(14), Labels: []string{"restaurant"}, ValidFrom: timePtr(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))},
+	} {
+		if err := app.InsertRecord("toronto", record); err != nil {
+			t.Fatalf("InsertRecord() error = %v", err)
+		}
+	}
+	validAt := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	response, err := app.ExecuteQuery("toronto", QueryRequest{
+		Near:    &NearFilter{Lat: 43.65, Lon: -79.38, Radius: 2000},
+		Labels:  []string{"restaurant"},
+		ValidAt: &validAt,
+		Limit:   10,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteQuery() error = %v", err)
+	}
+	if len(response.Results) != 1 || response.Results[0].Record.ID != "current" {
+		t.Fatalf("unexpected valid_at results: %#v", response.Results)
+	}
+}
+
 func TestRebuildIndexFromStoredRecords(t *testing.T) {
 	dataDir := t.TempDir()
 	app, err := NewApp(dataDir)
@@ -224,5 +266,9 @@ func floatPtr(value float64) *float64 {
 }
 
 func uintPtr(value uint) *uint {
+	return &value
+}
+
+func timePtr(value time.Time) *time.Time {
 	return &value
 }

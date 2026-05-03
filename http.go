@@ -64,11 +64,32 @@ func (app *App) handleGetStore(w http.ResponseWriter, r *http.Request) {
 
 func (app *App) handleStoreSubresource(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "stores" || parts[3] != "queries" {
+	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "stores" {
 		writeError(w, http.StatusNotFound, fmt.Errorf("not found"))
 		return
 	}
 	storeName := StoreName(parts[2])
+	if parts[3] == "records" {
+		var record RecordRequest
+		if err := json.NewDecoder(r.Body).Decode(&record); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := app.InsertRecord(storeName, record); err != nil {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "not found") {
+				status = http.StatusNotFound
+			}
+			writeError(w, status, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]string{"status": "inserted"})
+		return
+	}
+	if parts[3] != "queries" {
+		writeError(w, http.StatusNotFound, fmt.Errorf("not found"))
+		return
+	}
 
 	var request QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {

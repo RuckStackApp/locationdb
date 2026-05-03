@@ -1,6 +1,11 @@
 package locationdb
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -67,5 +72,77 @@ func TestQueryLanguageRequestValidate(t *testing.T) {
 
 	if err := (QueryLanguageRequest{}).Validate(); err == nil {
 		t.Fatalf("expected validation error")
+	}
+}
+
+func TestAppCreateStoreAndReloadCatalog(t *testing.T) {
+	dataDir := t.TempDir()
+	app, err := NewApp(dataDir)
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+
+	rootPath := filepath.Join(dataDir, "stores", "toronto")
+	definition, err := app.CreateStore(DefaultStoreConfig("toronto", rootPath))
+	if err != nil {
+		t.Fatalf("CreateStore() error = %v", err)
+	}
+	if definition.Config.Name != "toronto" {
+		t.Fatalf("Name = %q, want toronto", definition.Config.Name)
+	}
+
+	reloaded, err := NewApp(dataDir)
+	if err != nil {
+		t.Fatalf("NewApp() reload error = %v", err)
+	}
+	if _, ok := reloaded.GetStore("toronto"); !ok {
+		t.Fatalf("expected reloaded catalog to contain store")
+	}
+}
+
+func TestHTTPStoreAndQueryEndpoints(t *testing.T) {
+	dataDir := t.TempDir()
+	app, err := NewApp(dataDir)
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+
+	storeBody, err := json.Marshal(DefaultStoreConfig("toronto", filepath.Join(dataDir, "stores", "toronto")))
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	storeReq := httptest.NewRequest(http.MethodPost, "/v1/stores", bytes.NewReader(storeBody))
+	storeRes := httptest.NewRecorder()
+	app.Handler().ServeHTTP(storeRes, storeReq)
+	if storeRes.Code != http.StatusCreated {
+		t.Fatalf("create store status = %d, want %d", storeRes.Code, http.StatusCreated)
+	}
+
+	now := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	queryBody, err := json.Marshal(QueryRequest{
+		Near:    &NearFilter{Lat: 43.65, Lon: -79.38, Radius: 2000},
+		Labels:  []string{"restaurant"},
+		ValidAt: &now,
+		Limit:   50,
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	queryReq := httptest.NewRequest(http.MethodPost, "/v1/stores/toronto/queries", bytes.NewReader(queryBody))
+	queryRes := httptest.NewRecorder()
+	app.Handler().ServeHTTP(queryRes, queryReq)
+	if queryRes.Code != http.StatusOK {
+		t.Fatalf("query status = %d, want %d", queryRes.Code, http.StatusOK)
+	}
+
+	var response QueryResponse
+	if err := json.Unmarshal(queryRes.Body.Bytes(), &response); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if response.Status != "planned" {
+		t.Fatalf("query status field = %q, want planned", response.Status)
+	}
+	if len(response.Plan.Strategy) == 0 {
+		t.Fatalf("expected planned strategy steps")
 	}
 }

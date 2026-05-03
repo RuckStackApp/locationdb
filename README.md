@@ -38,3 +38,8 @@ NEAR(43.65, -79.38, 2000)
 AND label IN ("restaurant")
 AND valid_at = "2026-05-03T12:00:00Z"
 ```
+
+Records can be inserted with either a precomputed location code or raw
+coordinates. When `lat` and `lon` are provided, the service will encode them
+into a location code using either the provided record precision or the store's
+configured spatial precision.

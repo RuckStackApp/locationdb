@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	locationid "github.com/ruckstackapp/locationid/go"
 )
 
 func TestDefaultStoreConfig(t *testing.T) {
@@ -118,6 +120,26 @@ func TestHTTPStoreAndQueryEndpoints(t *testing.T) {
 		t.Fatalf("create store status = %d, want %d", storeRes.Code, http.StatusCreated)
 	}
 
+	codeB, err := locationid.Encode(43.7000, -79.5000, 14)
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+	for _, record := range []RecordRequest{
+		{ID: "r1", Lat: floatPtr(43.6501), Lon: floatPtr(-79.3801), Precision: uintPtr(14), Labels: []string{"restaurant"}},
+		{ID: "r2", Code: codeB.String(), Labels: []string{"park"}},
+	} {
+		recordBody, err := json.Marshal(record)
+		if err != nil {
+			t.Fatalf("json.Marshal() error = %v", err)
+		}
+		recordReq := httptest.NewRequest(http.MethodPost, "/v1/stores/toronto/records", bytes.NewReader(recordBody))
+		recordRes := httptest.NewRecorder()
+		app.Handler().ServeHTTP(recordRes, recordReq)
+		if recordRes.Code != http.StatusCreated {
+			t.Fatalf("insert record status = %d, want %d", recordRes.Code, http.StatusCreated)
+		}
+	}
+
 	now := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
 	queryBody, err := json.Marshal(QueryRequest{
 		Near:    &NearFilter{Lat: 43.65, Lon: -79.38, Radius: 2000},
@@ -139,10 +161,24 @@ func TestHTTPStoreAndQueryEndpoints(t *testing.T) {
 	if err := json.Unmarshal(queryRes.Body.Bytes(), &response); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v", err)
 	}
-	if response.Status != "planned" {
-		t.Fatalf("query status field = %q, want planned", response.Status)
+	if response.Status != "ok" {
+		t.Fatalf("query status field = %q, want ok", response.Status)
 	}
 	if len(response.Plan.Strategy) == 0 {
 		t.Fatalf("expected planned strategy steps")
 	}
+	if len(response.Results) != 1 {
+		t.Fatalf("result count = %d, want 1", len(response.Results))
+	}
+	if response.Results[0].Record.ID != "r1" {
+		t.Fatalf("result id = %q, want r1", response.Results[0].Record.ID)
+	}
+}
+
+func floatPtr(value float64) *float64 {
+	return &value
+}
+
+func uintPtr(value uint) *uint {
+	return &value
 }

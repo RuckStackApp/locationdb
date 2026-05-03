@@ -10,6 +10,10 @@ github.com/ruckstackapp/locationdb
 This repository will host the durable database layer built on top of
 `locationindex`.
 
+Per-store records are persisted in a compact binary format and are treated as
+the service source of truth. Location indexes are durable acceleration
+structures that can be reopened or rebuilt from stored records.
+
 Initial scope:
 
 - multiple independently configured stores

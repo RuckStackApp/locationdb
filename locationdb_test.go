@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -172,6 +173,49 @@ func TestHTTPStoreAndQueryEndpoints(t *testing.T) {
 	}
 	if response.Results[0].Record.ID != "r1" {
 		t.Fatalf("result id = %q, want r1", response.Results[0].Record.ID)
+	}
+
+	if _, err := os.Stat(filepath.Join(dataDir, "stores", "toronto", "records.ldb")); err != nil {
+		t.Fatalf("records.ldb stat error = %v", err)
+	}
+}
+
+func TestRebuildIndexFromStoredRecords(t *testing.T) {
+	dataDir := t.TempDir()
+	app, err := NewApp(dataDir)
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+
+	rootPath := filepath.Join(dataDir, "stores", "toronto")
+	if _, err := app.CreateStore(DefaultStoreConfig("toronto", rootPath)); err != nil {
+		t.Fatalf("CreateStore() error = %v", err)
+	}
+	if err := app.InsertRecord("toronto", RecordRequest{
+		ID: "r1", Lat: floatPtr(43.6501), Lon: floatPtr(-79.3801), Precision: uintPtr(14), Labels: []string{"restaurant"},
+	}); err != nil {
+		t.Fatalf("InsertRecord() error = %v", err)
+	}
+
+	if err := os.Remove(filepath.Join(rootPath, "index.lidx")); err != nil {
+		t.Fatalf("remove index error = %v", err)
+	}
+
+	reloaded, err := NewApp(dataDir)
+	if err != nil {
+		t.Fatalf("NewApp() reload error = %v", err)
+	}
+
+	response, err := reloaded.ExecuteQuery("toronto", QueryRequest{
+		Near:   &NearFilter{Lat: 43.65, Lon: -79.38, Radius: 2000},
+		Labels: []string{"restaurant"},
+		Limit:  10,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteQuery() error = %v", err)
+	}
+	if len(response.Results) != 1 || response.Results[0].Record.ID != "r1" {
+		t.Fatalf("unexpected rebuilt query results: %#v", response.Results)
 	}
 }
 

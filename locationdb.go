@@ -28,6 +28,7 @@ type StoreConfig struct {
 	Name         StoreName                  `json:"name"`
 	RootPath     string                     `json:"root_path"`
 	IndexOptions locationindex.IndexOptions `json:"index_options"`
+	Schema       *RecordSchema              `json:"schema,omitempty"`
 	Metadata     map[string]string          `json:"metadata,omitempty"`
 }
 
@@ -64,18 +65,56 @@ type RecordRequest struct {
 	Precision  *uint             `json:"precision,omitempty"`
 	ValidFrom  *time.Time        `json:"valid_from,omitempty"`
 	ValidUntil *time.Time        `json:"valid_until,omitempty"`
+	Fields     map[string]any    `json:"fields,omitempty"`
 	Labels     []string          `json:"labels,omitempty"`
 	Metadata   map[string]string `json:"metadata,omitempty"`
 }
 
+type FieldType string
+
+type CollectionType string
+
+const (
+	CollectionTypePointOfInterest CollectionType = "point_of_interest"
+	CollectionTypeMovingObject    CollectionType = "moving_object"
+
+	FieldTypeString   FieldType = "string"
+	FieldTypeInt      FieldType = "int"
+	FieldTypeFloat    FieldType = "float"
+	FieldTypeBool     FieldType = "bool"
+	FieldTypeDateTime FieldType = "datetime"
+)
+
+type FieldSchema struct {
+	Type     FieldType `json:"type"`
+	Required bool      `json:"required,omitempty"`
+	Indexed  bool      `json:"indexed,omitempty"`
+	Enum     []string  `json:"enum,omitempty"`
+}
+
+type RecordSchema struct {
+	CollectionType CollectionType          `json:"collection_type,omitempty"`
+	Fields         map[string]FieldSchema `json:"fields"`
+}
+
+type StoredValue struct {
+	Type     FieldType  `json:"type"`
+	String   *string    `json:"string,omitempty"`
+	Int      *int64     `json:"int,omitempty"`
+	Float    *float64   `json:"float,omitempty"`
+	Bool     *bool      `json:"bool,omitempty"`
+	DateTime *time.Time `json:"datetime,omitempty"`
+}
+
 type StoredRecord struct {
-	ID         string            `json:"id"`
-	Code       string            `json:"code"`
-	ValidFrom  *time.Time        `json:"valid_from,omitempty"`
-	ValidUntil *time.Time        `json:"valid_until,omitempty"`
-	Labels     []string          `json:"labels,omitempty"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
-	CreatedAt  time.Time         `json:"created_at"`
+	ID         string                 `json:"id"`
+	Code       string                 `json:"code"`
+	ValidFrom  *time.Time             `json:"valid_from,omitempty"`
+	ValidUntil *time.Time             `json:"valid_until,omitempty"`
+	Fields     map[string]StoredValue `json:"fields,omitempty"`
+	Labels     []string               `json:"labels,omitempty"`
+	Metadata   map[string]string      `json:"metadata,omitempty"`
+	CreatedAt  time.Time              `json:"created_at"`
 }
 
 type QueryPlan struct {
@@ -199,6 +238,35 @@ func (app *App) GetStore(name StoreName) (StoreDefinition, bool) {
 	return definition, ok
 }
 
+func (app *App) UpdateStoreSchema(name StoreName, schema *RecordSchema) (StoreDefinition, error) {
+	if schema != nil {
+		if err := schema.Validate(); err != nil {
+			return StoreDefinition{}, err
+		}
+	}
+
+	app.mu.Lock()
+	defer app.mu.Unlock()
+
+	definition, ok := app.catalog.Stores[name]
+	if !ok {
+		return StoreDefinition{}, fmt.Errorf("store %q not found", name)
+	}
+	definition.Config.Schema = schema
+	app.catalog.Stores[name] = definition
+	store, ok := app.stores[name]
+	if ok {
+		store.Definition = definition
+	}
+	if err := app.saveStoreConfig(definition); err != nil {
+		return StoreDefinition{}, err
+	}
+	if err := app.saveCatalogLocked(); err != nil {
+		return StoreDefinition{}, err
+	}
+	return definition, nil
+}
+
 func (app *App) ExecuteQuery(storeName StoreName, request QueryRequest) (QueryResponse, error) {
 	if err := request.Validate(); err != nil {
 		return QueryResponse{}, err
@@ -266,7 +334,51 @@ func (config StoreConfig) Validate() error {
 	if err := idx.ValidateOptions(); err != nil {
 		return err
 	}
+	if config.Schema != nil {
+		normalizeRecordSchema(config.Schema)
+		if err := config.Schema.Validate(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (schema *RecordSchema) Validate() error {
+	if schema == nil {
+		return nil
+	}
+	normalizeRecordSchema(schema)
+	switch schema.CollectionType {
+	case CollectionTypePointOfInterest, CollectionTypeMovingObject:
+	default:
+		return fmt.Errorf("unsupported collection type %q", schema.CollectionType)
+	}
+	for name, field := range schema.Fields {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("schema field name is required")
+		}
+		switch field.Type {
+		case FieldTypeString, FieldTypeInt, FieldTypeFloat, FieldTypeBool, FieldTypeDateTime:
+		default:
+			return fmt.Errorf("unsupported field type %q for field %q", field.Type, name)
+		}
+		if len(field.Enum) > 0 && field.Type != FieldTypeString {
+			return fmt.Errorf("enum is only supported for string fields: %q", name)
+		}
+	}
+	return nil
+}
+
+func normalizeRecordSchema(schema *RecordSchema) {
+	if schema == nil {
+		return
+	}
+	if schema.CollectionType == "" {
+		schema.CollectionType = CollectionTypePointOfInterest
+	}
+	if schema.Fields == nil {
+		schema.Fields = map[string]FieldSchema{}
+	}
 }
 
 func (catalog Catalog) Validate() error {
@@ -402,6 +514,10 @@ func (app *App) InsertRecord(storeName StoreName, request RecordRequest) error {
 	if err != nil {
 		return err
 	}
+	fields, err := coerceRecordFields(store.Definition.Config.Schema, request.Fields)
+	if err != nil {
+		return err
+	}
 	labels := make([]locationindex.Label, 0, len(request.Labels))
 	for _, label := range request.Labels {
 		labels = append(labels, locationindex.Label(label))
@@ -423,6 +539,7 @@ func (app *App) InsertRecord(storeName StoreName, request RecordRequest) error {
 		Code:       code,
 		ValidFrom:  cloneTimePtr(request.ValidFrom),
 		ValidUntil: cloneTimePtr(request.ValidUntil),
+		Fields:     fields,
 		Labels:     append([]string(nil), request.Labels...),
 		Metadata:   cloneStringMap(request.Metadata),
 		CreatedAt:  time.Now().UTC(),
@@ -559,6 +676,94 @@ func cloneStringMap(values map[string]string) map[string]string {
 	return out
 }
 
+func coerceRecordFields(schema *RecordSchema, input map[string]any) (map[string]StoredValue, error) {
+	if schema == nil {
+		return nil, nil
+	}
+	if input == nil {
+		input = map[string]any{}
+	}
+	out := make(map[string]StoredValue, len(input))
+	for name, field := range schema.Fields {
+		value, ok := input[name]
+		if !ok {
+			if field.Required {
+				return nil, fmt.Errorf("missing required field %q", name)
+			}
+			continue
+		}
+		stored, err := coerceStoredValue(name, field, value)
+		if err != nil {
+			return nil, err
+		}
+		out[name] = stored
+	}
+	for name := range input {
+		if _, ok := schema.Fields[name]; !ok {
+			return nil, fmt.Errorf("field %q is not defined in schema", name)
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func coerceStoredValue(name string, field FieldSchema, value any) (StoredValue, error) {
+	switch field.Type {
+	case FieldTypeString:
+		stringValue, ok := value.(string)
+		if !ok {
+			return StoredValue{}, fmt.Errorf("field %q must be a string", name)
+		}
+		if len(field.Enum) > 0 {
+			matched := false
+			for _, allowed := range field.Enum {
+				if stringValue == allowed {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return StoredValue{}, fmt.Errorf("field %q must be one of the configured enum values", name)
+			}
+		}
+		return StoredValue{Type: field.Type, String: &stringValue}, nil
+	case FieldTypeInt:
+		number, ok := value.(float64)
+		if !ok || number != float64(int64(number)) {
+			return StoredValue{}, fmt.Errorf("field %q must be an integer", name)
+		}
+		intValue := int64(number)
+		return StoredValue{Type: field.Type, Int: &intValue}, nil
+	case FieldTypeFloat:
+		number, ok := value.(float64)
+		if !ok {
+			return StoredValue{}, fmt.Errorf("field %q must be a number", name)
+		}
+		return StoredValue{Type: field.Type, Float: &number}, nil
+	case FieldTypeBool:
+		boolValue, ok := value.(bool)
+		if !ok {
+			return StoredValue{}, fmt.Errorf("field %q must be a boolean", name)
+		}
+		return StoredValue{Type: field.Type, Bool: &boolValue}, nil
+	case FieldTypeDateTime:
+		stringValue, ok := value.(string)
+		if !ok {
+			return StoredValue{}, fmt.Errorf("field %q must be an RFC3339 datetime string", name)
+		}
+		timeValue, err := time.Parse(time.RFC3339, stringValue)
+		if err != nil {
+			return StoredValue{}, fmt.Errorf("field %q must be an RFC3339 datetime string", name)
+		}
+		timeValue = timeValue.UTC()
+		return StoredValue{Type: field.Type, DateTime: &timeValue}, nil
+	default:
+		return StoredValue{}, fmt.Errorf("unsupported field type %q", field.Type)
+	}
+}
+
 func cloneTimePtr(value *time.Time) *time.Time {
 	if value == nil {
 		return nil
@@ -630,6 +835,17 @@ func writeStoredRecord(writer io.Writer, record StoredRecord) error {
 	if err := writeOptionalTime(writer, record.ValidUntil); err != nil {
 		return err
 	}
+	if err := binary.Write(writer, binary.BigEndian, uint32(len(record.Fields))); err != nil {
+		return err
+	}
+	for _, key := range sortedStoredValueKeys(record.Fields) {
+		if err := writeString(writer, key); err != nil {
+			return err
+		}
+		if err := writeStoredValue(writer, record.Fields[key]); err != nil {
+			return err
+		}
+	}
 	if err := binary.Write(writer, binary.BigEndian, int64(record.CreatedAt.UTC().UnixNano())); err != nil {
 		return err
 	}
@@ -672,6 +888,22 @@ func readStoredRecord(reader io.Reader) (StoredRecord, error) {
 	if err != nil {
 		return StoredRecord{}, err
 	}
+	var fieldCount uint32
+	if err := binary.Read(reader, binary.BigEndian, &fieldCount); err != nil {
+		return StoredRecord{}, err
+	}
+	fields := make(map[string]StoredValue, fieldCount)
+	for i := uint32(0); i < fieldCount; i++ {
+		key, err := readString(reader)
+		if err != nil {
+			return StoredRecord{}, err
+		}
+		value, err := readStoredValue(reader)
+		if err != nil {
+			return StoredRecord{}, err
+		}
+		fields[key] = value
+	}
 	var createdAtNano int64
 	if err := binary.Read(reader, binary.BigEndian, &createdAtNano); err != nil {
 		return StoredRecord{}, err
@@ -712,10 +944,77 @@ func readStoredRecord(reader io.Reader) (StoredRecord, error) {
 		Code:       code,
 		ValidFrom:  validFrom,
 		ValidUntil: validUntil,
+		Fields:     fields,
 		Labels:     labels,
 		Metadata:   metadata,
 		CreatedAt:  time.Unix(0, createdAtNano).UTC(),
 	}, nil
+}
+
+func writeStoredValue(writer io.Writer, value StoredValue) error {
+	if err := writeString(writer, string(value.Type)); err != nil {
+		return err
+	}
+	switch value.Type {
+	case FieldTypeString:
+		return writeString(writer, derefString(value.String))
+	case FieldTypeInt:
+		return binary.Write(writer, binary.BigEndian, derefInt64(value.Int))
+	case FieldTypeFloat:
+		return binary.Write(writer, binary.BigEndian, derefFloat64(value.Float))
+	case FieldTypeBool:
+		return binary.Write(writer, binary.BigEndian, derefBool(value.Bool))
+	case FieldTypeDateTime:
+		if value.DateTime == nil {
+			return binary.Write(writer, binary.BigEndian, int64(0))
+		}
+		return binary.Write(writer, binary.BigEndian, value.DateTime.UTC().UnixNano())
+	default:
+		return fmt.Errorf("unsupported stored value type %q", value.Type)
+	}
+}
+
+func readStoredValue(reader io.Reader) (StoredValue, error) {
+	typeName, err := readString(reader)
+	if err != nil {
+		return StoredValue{}, err
+	}
+	fieldType := FieldType(typeName)
+	switch fieldType {
+	case FieldTypeString:
+		value, err := readString(reader)
+		if err != nil {
+			return StoredValue{}, err
+		}
+		return StoredValue{Type: fieldType, String: &value}, nil
+	case FieldTypeInt:
+		var value int64
+		if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
+			return StoredValue{}, err
+		}
+		return StoredValue{Type: fieldType, Int: &value}, nil
+	case FieldTypeFloat:
+		var value float64
+		if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
+			return StoredValue{}, err
+		}
+		return StoredValue{Type: fieldType, Float: &value}, nil
+	case FieldTypeBool:
+		var value bool
+		if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
+			return StoredValue{}, err
+		}
+		return StoredValue{Type: fieldType, Bool: &value}, nil
+	case FieldTypeDateTime:
+		var value int64
+		if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
+			return StoredValue{}, err
+		}
+		timeValue := time.Unix(0, value).UTC()
+		return StoredValue{Type: fieldType, DateTime: &timeValue}, nil
+	default:
+		return StoredValue{}, fmt.Errorf("unsupported stored value type %q", fieldType)
+	}
 }
 
 func writeOptionalTime(writer io.Writer, value *time.Time) error {
@@ -792,6 +1091,43 @@ func sortedMetadataKeys(metadata map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func sortedStoredValueKeys(values map[string]StoredValue) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func derefInt64(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func derefFloat64(value *float64) float64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func derefBool(value *bool) bool {
+	if value == nil {
+		return false
+	}
+	return *value
 }
 
 func writeAtomically(path string, write func(file *os.File) error) error {

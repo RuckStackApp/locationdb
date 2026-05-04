@@ -6,7 +6,20 @@ export type StoreConfig = {
     name: string;
     root_path: string;
     index_options: IndexOptions;
+    schema?: RecordSchema;
     metadata?: Record<string, string>;
+};
+export type FieldType = 'string' | 'int' | 'float' | 'bool' | 'datetime';
+export type CollectionType = 'point_of_interest' | 'moving_object';
+export type FieldSchema = {
+    type: FieldType;
+    required?: boolean;
+    indexed?: boolean;
+    enum?: string[];
+};
+export type RecordSchema = {
+    collection_type?: CollectionType;
+    fields: Record<string, FieldSchema>;
 };
 export type StoreDefinition = {
     config: StoreConfig;
@@ -51,6 +64,7 @@ export type RecordRequest = {
     precision?: number;
     valid_from?: string;
     valid_until?: string;
+    fields?: Record<string, unknown>;
     labels?: string[];
     metadata?: Record<string, string>;
 };
@@ -65,6 +79,7 @@ export declare class LocationDBClient {
     }>;
     createStore(config: StoreConfig): Promise<StoreDefinition>;
     getStore(name: string): Promise<StoreDefinition>;
+    updateSchema(storeName: string, schema: RecordSchema): Promise<StoreDefinition>;
     insertRecord(storeName: string, record: RecordRequest): Promise<{
         status: string;
     }>;

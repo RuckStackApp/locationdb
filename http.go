@@ -87,6 +87,28 @@ func (app *App) handleStoreSubresource(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusCreated, map[string]string{"status": "inserted"})
 		return
 	}
+	if parts[3] == "schema" {
+		if r.Method != http.MethodPut {
+			writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+			return
+		}
+		var schema RecordSchema
+		if err := json.NewDecoder(r.Body).Decode(&schema); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		definition, err := app.UpdateStoreSchema(storeName, &schema)
+		if err != nil {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "not found") {
+				status = http.StatusNotFound
+			}
+			writeError(w, status, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, definition)
+		return
+	}
 	if parts[3] != "queries" {
 		writeError(w, http.StatusNotFound, fmt.Errorf("not found"))
 		return

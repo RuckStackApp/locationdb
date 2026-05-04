@@ -18,6 +18,12 @@ export class LocationDBClient {
     async getStore(name) {
         return this.request(`/v1/stores/${encodeURIComponent(name)}`);
     }
+    async updateSchema(storeName, schema) {
+        return this.request(`/v1/stores/${encodeURIComponent(storeName)}/schema`, {
+            method: 'PUT',
+            body: JSON.stringify(schema)
+        });
+    }
     async insertRecord(storeName, record) {
         return this.request(`/v1/stores/${encodeURIComponent(storeName)}/records`, {
             method: 'POST',

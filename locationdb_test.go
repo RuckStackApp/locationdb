@@ -28,6 +28,10 @@ func TestDefaultStoreConfig(t *testing.T) {
 
 func TestStoreConfigValidate(t *testing.T) {
 	config := DefaultStoreConfig("toronto", "/data/toronto")
+	config.Schema = &RecordSchema{Fields: map[string]FieldSchema{
+		"name":   {Type: FieldTypeString, Required: true},
+		"rating": {Type: FieldTypeFloat},
+	}}
 	if err := config.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
 	}
@@ -35,6 +39,23 @@ func TestStoreConfigValidate(t *testing.T) {
 	bad := DefaultStoreConfig("", "")
 	if err := bad.Validate(); err == nil {
 		t.Fatalf("expected validation error")
+	}
+}
+
+func TestRecordSchemaValidate(t *testing.T) {
+	schema := &RecordSchema{Fields: map[string]FieldSchema{
+		"name":      {Type: FieldTypeString, Required: true, Enum: []string{"alice", "bob"}},
+		"opened_at": {Type: FieldTypeDateTime},
+	}}
+	if err := schema.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	bad := &RecordSchema{Fields: map[string]FieldSchema{
+		"rating": {Type: FieldTypeFloat, Enum: []string{"x"}},
+	}}
+	if err := bad.Validate(); err == nil {
+		t.Fatalf("expected schema validation error")
 	}
 }
 
@@ -119,7 +140,12 @@ func TestHTTPStoreAndQueryEndpoints(t *testing.T) {
 		t.Fatalf("NewApp() error = %v", err)
 	}
 
-	storeBody, err := json.Marshal(DefaultStoreConfig("toronto", filepath.Join(dataDir, "stores", "toronto")))
+	config := DefaultStoreConfig("toronto", filepath.Join(dataDir, "stores", "toronto"))
+	config.Schema = &RecordSchema{Fields: map[string]FieldSchema{
+		"name":   {Type: FieldTypeString, Required: true},
+		"rating": {Type: FieldTypeFloat},
+	}}
+	storeBody, err := json.Marshal(config)
 	if err != nil {
 		t.Fatalf("json.Marshal() error = %v", err)
 	}
@@ -135,8 +161,8 @@ func TestHTTPStoreAndQueryEndpoints(t *testing.T) {
 		t.Fatalf("Encode() error = %v", err)
 	}
 	for _, record := range []RecordRequest{
-		{ID: "r1", Lat: floatPtr(43.6501), Lon: floatPtr(-79.3801), Precision: uintPtr(14), Labels: []string{"restaurant"}, ValidFrom: timePtr(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))},
-		{ID: "r2", Code: codeB.String(), Labels: []string{"park"}},
+		{ID: "r1", Lat: floatPtr(43.6501), Lon: floatPtr(-79.3801), Precision: uintPtr(14), Labels: []string{"restaurant"}, ValidFrom: timePtr(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)), Fields: map[string]any{"name": "Cafe", "rating": 4.5}},
+		{ID: "r2", Code: codeB.String(), Labels: []string{"park"}, Fields: map[string]any{"name": "Park"}},
 	} {
 		recordBody, err := json.Marshal(record)
 		if err != nil {
@@ -219,6 +245,28 @@ func TestQueryValidAtFiltering(t *testing.T) {
 	}
 	if len(response.Results) != 1 || response.Results[0].Record.ID != "current" {
 		t.Fatalf("unexpected valid_at results: %#v", response.Results)
+	}
+}
+
+func TestInsertRecordSchemaValidation(t *testing.T) {
+	dataDir := t.TempDir()
+	app, err := NewApp(dataDir)
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+	config := DefaultStoreConfig("toronto", filepath.Join(dataDir, "stores", "toronto"))
+	config.Schema = &RecordSchema{Fields: map[string]FieldSchema{
+		"name":      {Type: FieldTypeString, Required: true},
+		"opened_at": {Type: FieldTypeDateTime},
+	}}
+	if _, err := app.CreateStore(config); err != nil {
+		t.Fatalf("CreateStore() error = %v", err)
+	}
+	if err := app.InsertRecord("toronto", RecordRequest{ID: "bad", Lat: floatPtr(43.6501), Lon: floatPtr(-79.3801), Precision: uintPtr(14)}); err == nil {
+		t.Fatalf("expected missing required field error")
+	}
+	if err := app.InsertRecord("toronto", RecordRequest{ID: "bad2", Lat: floatPtr(43.6501), Lon: floatPtr(-79.3801), Precision: uintPtr(14), Fields: map[string]any{"name": 1}}); err == nil {
+		t.Fatalf("expected field type error")
 	}
 }
 

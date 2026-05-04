@@ -46,6 +46,7 @@ func TestRecordSchemaValidate(t *testing.T) {
 	schema := &RecordSchema{Fields: map[string]FieldSchema{
 		"name":      {Type: FieldTypeString, Required: true, Enum: []string{"alice", "bob"}},
 		"opened_at": {Type: FieldTypeDateTime},
+		"primary":   {Type: FieldTypeGeometry, GeometryType: GeometryTypePoint},
 	}}
 	if err := schema.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
@@ -56,6 +57,13 @@ func TestRecordSchemaValidate(t *testing.T) {
 	}}
 	if err := bad.Validate(); err == nil {
 		t.Fatalf("expected schema validation error")
+	}
+
+	badGeometry := &RecordSchema{Fields: map[string]FieldSchema{
+		"primary": {Type: FieldTypeGeometry, GeometryType: "polygon"},
+	}}
+	if err := badGeometry.Validate(); err == nil {
+		t.Fatalf("expected geometry schema validation error")
 	}
 }
 
@@ -267,6 +275,46 @@ func TestInsertRecordSchemaValidation(t *testing.T) {
 	}
 	if err := app.InsertRecord("toronto", RecordRequest{ID: "bad2", Lat: floatPtr(43.6501), Lon: floatPtr(-79.3801), Precision: uintPtr(14), Fields: map[string]any{"name": 1}}); err == nil {
 		t.Fatalf("expected field type error")
+	}
+}
+
+func TestInsertRecordFromGeometryField(t *testing.T) {
+	dataDir := t.TempDir()
+	app, err := NewApp(dataDir)
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+	config := DefaultStoreConfig("places", filepath.Join(dataDir, "stores", "places"))
+	config.Schema = &RecordSchema{Fields: map[string]FieldSchema{
+		"name":             {Type: FieldTypeString, Required: true},
+		"primary_geometry": {Type: FieldTypeGeometry, GeometryType: GeometryTypePoint},
+	}}
+	if _, err := app.CreateStore(config); err != nil {
+		t.Fatalf("CreateStore() error = %v", err)
+	}
+	if err := app.InsertRecord("places", RecordRequest{
+		ID: "g1",
+		Fields: map[string]any{
+			"name": "Cafe",
+			"primary_geometry": map[string]any{
+				"lat": 43.6501,
+				"lon": -79.3801,
+			},
+		},
+		Labels: []string{"restaurant"},
+	}); err != nil {
+		t.Fatalf("InsertRecord() error = %v", err)
+	}
+	response, err := app.ExecuteQuery("places", QueryRequest{
+		Near: &NearFilter{Lat: 43.65, Lon: -79.38, Radius: 2000},
+		Labels: []string{"restaurant"},
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteQuery() error = %v", err)
+	}
+	if len(response.Results) != 1 || response.Results[0].Record.ID != "g1" {
+		t.Fatalf("unexpected geometry query results: %#v", response.Results)
 	}
 }
 

@@ -14,6 +14,7 @@ func (app *App) routes() http.Handler {
 	mux.HandleFunc("POST /v1/stores", app.handleCreateStore)
 	mux.HandleFunc("GET /v1/stores/", app.handleGetStore)
 	mux.HandleFunc("POST /v1/stores/", app.handleStoreSubresource)
+	mux.HandleFunc("PUT /v1/stores/", app.handleStoreSubresource)
 	mux.Handle("/", app.uiHandler())
 	return mux
 }

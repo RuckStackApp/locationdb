@@ -11,12 +11,15 @@ export type StoreConfig = {
   metadata?: Record<string, string>
 }
 
-export type FieldType = 'string' | 'int' | 'float' | 'bool' | 'datetime'
+export type FieldType = 'string' | 'int' | 'float' | 'bool' | 'datetime' | 'geometry'
+
+export type GeometryType = 'point'
 
 export type CollectionType = 'point_of_interest' | 'moving_object'
 
 export type FieldSchema = {
   type: FieldType
+  geometry_type?: GeometryType
   required?: boolean
   indexed?: boolean
   enum?: string[]
@@ -48,12 +51,32 @@ export type QueryPlan = {
   strategy: string[]
 }
 
+export type StoredPoint = {
+  lat: number
+  lon: number
+  code?: string
+}
+
+export type StoredValue = {
+  type: FieldType
+  geometry_type?: GeometryType
+  string?: string
+  int?: number
+  float?: number
+  bool?: boolean
+  datetime?: string
+  point?: StoredPoint
+}
+
 export type QueryResultRecord = {
   id: string
   code: string
-  payload: string
+  valid_from?: string
+  valid_until?: string
+  fields?: Record<string, StoredValue>
   labels?: string[]
   metadata?: Record<string, string>
+  created_at?: string
 }
 
 export type QueryResult = {

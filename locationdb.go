@@ -41,6 +41,7 @@ type Catalog struct {
 }
 
 type NearFilter struct {
+	Field  string  `json:"field,omitempty"`
 	Lat    float64 `json:"lat"`
 	Lon    float64 `json:"lon"`
 	Radius float64 `json:"radius"`
@@ -78,6 +79,7 @@ const (
 	CollectionTypePointOfInterest CollectionType = "point_of_interest"
 	CollectionTypeMovingObject    CollectionType = "moving_object"
 
+	FieldTypeGeometry FieldType = "geometry"
 	FieldTypeString   FieldType = "string"
 	FieldTypeInt      FieldType = "int"
 	FieldTypeFloat    FieldType = "float"
@@ -85,25 +87,38 @@ const (
 	FieldTypeDateTime FieldType = "datetime"
 )
 
+type GeometryType string
+
+const GeometryTypePoint GeometryType = "point"
+
 type FieldSchema struct {
-	Type     FieldType `json:"type"`
-	Required bool      `json:"required,omitempty"`
-	Indexed  bool      `json:"indexed,omitempty"`
-	Enum     []string  `json:"enum,omitempty"`
+	Type         FieldType    `json:"type"`
+	GeometryType GeometryType `json:"geometry_type,omitempty"`
+	Required     bool         `json:"required,omitempty"`
+	Indexed      bool         `json:"indexed,omitempty"`
+	Enum         []string     `json:"enum,omitempty"`
 }
 
 type RecordSchema struct {
-	CollectionType CollectionType          `json:"collection_type,omitempty"`
+	CollectionType CollectionType         `json:"collection_type,omitempty"`
 	Fields         map[string]FieldSchema `json:"fields"`
 }
 
 type StoredValue struct {
-	Type     FieldType  `json:"type"`
-	String   *string    `json:"string,omitempty"`
-	Int      *int64     `json:"int,omitempty"`
-	Float    *float64   `json:"float,omitempty"`
-	Bool     *bool      `json:"bool,omitempty"`
-	DateTime *time.Time `json:"datetime,omitempty"`
+	Type         FieldType    `json:"type"`
+	GeometryType GeometryType `json:"geometry_type,omitempty"`
+	String       *string      `json:"string,omitempty"`
+	Int          *int64       `json:"int,omitempty"`
+	Float        *float64     `json:"float,omitempty"`
+	Bool         *bool        `json:"bool,omitempty"`
+	DateTime     *time.Time   `json:"datetime,omitempty"`
+	Point        *StoredPoint `json:"point,omitempty"`
+}
+
+type StoredPoint struct {
+	Lat  float64 `json:"lat"`
+	Lon  float64 `json:"lon"`
+	Code string  `json:"code,omitempty"`
 }
 
 type StoredRecord struct {
@@ -359,6 +374,21 @@ func (schema *RecordSchema) Validate() error {
 		}
 		switch field.Type {
 		case FieldTypeString, FieldTypeInt, FieldTypeFloat, FieldTypeBool, FieldTypeDateTime:
+			if field.GeometryType != "" {
+				return fmt.Errorf("geometry_type is only valid for geometry fields: %q", name)
+			}
+		case FieldTypeGeometry:
+			if field.GeometryType == "" {
+				field.GeometryType = GeometryTypePoint
+				schema.Fields[name] = field
+			}
+			if field.GeometryType != GeometryTypePoint {
+				return fmt.Errorf("unsupported geometry type %q for field %q", field.GeometryType, name)
+			}
+			if !field.Indexed {
+				field.Indexed = true
+				schema.Fields[name] = field
+			}
 		default:
 			return fmt.Errorf("unsupported field type %q for field %q", field.Type, name)
 		}
@@ -419,9 +449,6 @@ func (request RecordRequest) Validate() error {
 	}
 	hasCode := strings.TrimSpace(request.Code) != ""
 	hasCoords := request.Lat != nil || request.Lon != nil
-	if !hasCode && !hasCoords {
-		return fmt.Errorf("either record code or lat/lon is required")
-	}
 	if hasCode && hasCoords {
 		return fmt.Errorf("provide either record code or lat/lon, not both")
 	}
@@ -524,15 +551,26 @@ func (app *App) InsertRecord(storeName StoreName, request RecordRequest) error {
 	}
 	code := request.Code
 	if code == "" {
-		precision := store.Definition.Config.IndexOptions.SpatialCellPrecision
-		if request.Precision != nil {
-			precision = *request.Precision
+		if request.Lat != nil && request.Lon != nil {
+			precision := store.Definition.Config.IndexOptions.SpatialCellPrecision
+			if request.Precision != nil {
+				precision = *request.Precision
+			}
+			encoded, err := locationid.Encode(*request.Lat, *request.Lon, precision)
+			if err != nil {
+				return err
+			}
+			code = encoded.String()
+		} else {
+			derivedCode, err := deriveIndexedCodeFromFields(store.Definition.Config.Schema, store.Definition.Config.IndexOptions.SpatialCellPrecision, fields)
+			if err != nil {
+				return err
+			}
+			code = derivedCode
 		}
-		encoded, err := locationid.Encode(*request.Lat, *request.Lon, precision)
-		if err != nil {
-			return err
-		}
-		code = encoded.String()
+	}
+	if strings.TrimSpace(code) == "" {
+		return fmt.Errorf("record must provide an indexable location")
 	}
 	stored := StoredRecord{
 		ID:         request.ID,
@@ -711,6 +749,15 @@ func coerceRecordFields(schema *RecordSchema, input map[string]any) (map[string]
 
 func coerceStoredValue(name string, field FieldSchema, value any) (StoredValue, error) {
 	switch field.Type {
+	case FieldTypeGeometry:
+		if field.GeometryType != GeometryTypePoint {
+			return StoredValue{}, fmt.Errorf("unsupported geometry type %q for field %q", field.GeometryType, name)
+		}
+		point, err := coercePointValue(name, value)
+		if err != nil {
+			return StoredValue{}, err
+		}
+		return StoredValue{Type: field.Type, GeometryType: field.GeometryType, Point: point}, nil
 	case FieldTypeString:
 		stringValue, ok := value.(string)
 		if !ok {
@@ -762,6 +809,68 @@ func coerceStoredValue(name string, field FieldSchema, value any) (StoredValue, 
 	default:
 		return StoredValue{}, fmt.Errorf("unsupported field type %q", field.Type)
 	}
+}
+
+func coercePointValue(name string, value any) (*StoredPoint, error) {
+	mapValue, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("field %q must be an object for geometry point values", name)
+	}
+	code, hasCode := stringFromAny(mapValue["code"])
+	lat, hasLat := floatFromAny(mapValue["lat"])
+	lon, hasLon := floatFromAny(mapValue["lon"])
+	if hasCode && (hasLat || hasLon) {
+		return nil, fmt.Errorf("field %q must provide either code or lat/lon", name)
+	}
+	if hasCode {
+		decoded, err := locationid.Decode(locationid.New(code))
+		if err != nil {
+			return nil, err
+		}
+		return &StoredPoint{Lat: decoded.CenterLat, Lon: decoded.CenterLon, Code: code}, nil
+	}
+	if !hasLat || !hasLon {
+		return nil, fmt.Errorf("field %q must provide code or both lat and lon", name)
+	}
+	return &StoredPoint{Lat: lat, Lon: lon}, nil
+}
+
+func deriveIndexedCodeFromFields(schema *RecordSchema, precision uint, fields map[string]StoredValue) (string, error) {
+	if schema == nil {
+		return "", nil
+	}
+	for name, field := range schema.Fields {
+		if field.Type != FieldTypeGeometry || !field.Indexed {
+			continue
+		}
+		stored, ok := fields[name]
+		if !ok || stored.Point == nil {
+			continue
+		}
+		if stored.Point.Code != "" {
+			return stored.Point.Code, nil
+		}
+		encoded, err := locationid.Encode(stored.Point.Lat, stored.Point.Lon, precision)
+		if err != nil {
+			return "", err
+		}
+		point := *stored.Point
+		point.Code = encoded.String()
+		stored.Point = &point
+		fields[name] = stored
+		return point.Code, nil
+	}
+	return "", nil
+}
+
+func stringFromAny(value any) (string, bool) {
+	stringValue, ok := value.(string)
+	return stringValue, ok && strings.TrimSpace(stringValue) != ""
+}
+
+func floatFromAny(value any) (float64, bool) {
+	floatValue, ok := value.(float64)
+	return floatValue, ok
 }
 
 func cloneTimePtr(value *time.Time) *time.Time {
@@ -955,7 +1064,21 @@ func writeStoredValue(writer io.Writer, value StoredValue) error {
 	if err := writeString(writer, string(value.Type)); err != nil {
 		return err
 	}
+	if err := writeString(writer, string(value.GeometryType)); err != nil {
+		return err
+	}
 	switch value.Type {
+	case FieldTypeGeometry:
+		if value.Point == nil {
+			return fmt.Errorf("missing point value for geometry field")
+		}
+		if err := binary.Write(writer, binary.BigEndian, value.Point.Lat); err != nil {
+			return err
+		}
+		if err := binary.Write(writer, binary.BigEndian, value.Point.Lon); err != nil {
+			return err
+		}
+		return writeString(writer, value.Point.Code)
 	case FieldTypeString:
 		return writeString(writer, derefString(value.String))
 	case FieldTypeInt:
@@ -979,39 +1102,58 @@ func readStoredValue(reader io.Reader) (StoredValue, error) {
 	if err != nil {
 		return StoredValue{}, err
 	}
+	geometryTypeName, err := readString(reader)
+	if err != nil {
+		return StoredValue{}, err
+	}
 	fieldType := FieldType(typeName)
+	geometryType := GeometryType(geometryTypeName)
 	switch fieldType {
+	case FieldTypeGeometry:
+		var lat float64
+		if err := binary.Read(reader, binary.BigEndian, &lat); err != nil {
+			return StoredValue{}, err
+		}
+		var lon float64
+		if err := binary.Read(reader, binary.BigEndian, &lon); err != nil {
+			return StoredValue{}, err
+		}
+		code, err := readString(reader)
+		if err != nil {
+			return StoredValue{}, err
+		}
+		return StoredValue{Type: fieldType, GeometryType: geometryType, Point: &StoredPoint{Lat: lat, Lon: lon, Code: code}}, nil
 	case FieldTypeString:
 		value, err := readString(reader)
 		if err != nil {
 			return StoredValue{}, err
 		}
-		return StoredValue{Type: fieldType, String: &value}, nil
+		return StoredValue{Type: fieldType, GeometryType: geometryType, String: &value}, nil
 	case FieldTypeInt:
 		var value int64
 		if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
 			return StoredValue{}, err
 		}
-		return StoredValue{Type: fieldType, Int: &value}, nil
+		return StoredValue{Type: fieldType, GeometryType: geometryType, Int: &value}, nil
 	case FieldTypeFloat:
 		var value float64
 		if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
 			return StoredValue{}, err
 		}
-		return StoredValue{Type: fieldType, Float: &value}, nil
+		return StoredValue{Type: fieldType, GeometryType: geometryType, Float: &value}, nil
 	case FieldTypeBool:
 		var value bool
 		if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
 			return StoredValue{}, err
 		}
-		return StoredValue{Type: fieldType, Bool: &value}, nil
+		return StoredValue{Type: fieldType, GeometryType: geometryType, Bool: &value}, nil
 	case FieldTypeDateTime:
 		var value int64
 		if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
 			return StoredValue{}, err
 		}
 		timeValue := time.Unix(0, value).UTC()
-		return StoredValue{Type: fieldType, DateTime: &timeValue}, nil
+		return StoredValue{Type: fieldType, GeometryType: geometryType, DateTime: &timeValue}, nil
 	default:
 		return StoredValue{}, fmt.Errorf("unsupported stored value type %q", fieldType)
 	}

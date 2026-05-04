@@ -5,14 +5,27 @@
     type QueryResponse,
     type RecordSchema,
     type FieldSchema,
+    type StoredValue,
     type StoreDefinition
   } from '@ruckstack/locationdb'
 
   // Not a real server field — kept to satisfy linter references only
   type CollectionType = string
 
-  type FieldType = 'string' | 'int' | 'float' | 'bool' | 'datetime'
-  type TabKind = 'query' | 'schema'
+  type FieldType = 'string' | 'int' | 'float' | 'bool' | 'datetime' | 'geometry'
+  type GeometrySubtype = 'point'
+  type TabKind = 'query' | 'schema' | 'browse'
+  type BrowseSubview = 'records' | 'add'
+
+  type NewRecordForm = {
+    id: string
+    lat: string
+    lon: string
+    validFrom: string
+    validUntil: string
+    labels: string
+    fields: Record<string, string>
+  }
 
   type WorkspaceTab = {
     id: string
@@ -24,6 +37,7 @@
     _id: string
     name: string
     type: FieldType
+    geometryType: GeometrySubtype
     required: boolean
     indexed: boolean
     enum: string
@@ -46,6 +60,15 @@
 
   // query params per tab
   let queryParams: Record<string, { lat: number; lon: number; radius: number; labels: string; validAt: string; limit: number }> = {}
+
+  // browse state per tab
+  let browseSubview: Record<string, BrowseSubview> = {}
+  let browseParams: Record<string, { lat: number; lon: number; radius: number; labels: string; validAt: string; limit: number }> = {}
+  let browseResults: Record<string, QueryResponse | null> = {}
+  let newRecordForms: Record<string, NewRecordForm> = {}
+  let insertError: Record<string, string> = {}
+  let insertSuccess: Record<string, string> = {}
+  let inserting: Record<string, boolean> = {}
 
   // new collection modal
   let showNewModal = false
@@ -82,6 +105,7 @@
       _id: uid(),
       name,
       type: f.type as FieldType,
+      geometryType: (f.geometry_type ?? 'point') as GeometrySubtype,
       required: f.required ?? false,
       indexed: f.indexed ?? false,
       enum: (f.enum ?? []).join(', ')
@@ -95,9 +119,10 @@
       const enumVals = row.enum.split(',').map(s => s.trim()).filter(Boolean)
       fields[row.name.trim()] = {
         type: row.type,
+        ...(row.type === 'geometry' ? { geometry_type: row.geometryType } : {}),
         required: row.required,
         indexed: row.indexed,
-        ...(enumVals.length ? { enum: enumVals } : {})
+        ...(enumVals.length && row.type === 'string' ? { enum: enumVals } : {})
       }
     }
     return { fields }
@@ -114,6 +139,11 @@
       if (kind === 'query' && !queryParams[id]) {
         queryParams[id] = { lat: 43.65, lon: -79.38, radius: 2000, labels: '', validAt: '', limit: 50 }
       }
+      if (kind === 'browse') {
+        if (!browseParams[id]) browseParams[id] = { lat: 43.65, lon: -79.38, radius: 2000, labels: '', validAt: '', limit: 50 }
+        if (!browseSubview[id]) browseSubview[id] = 'records'
+        initNewRecordForm(id)
+      }
     }
     activeTabId = id
   }
@@ -125,7 +155,7 @@
   }
 
   function addField(tabId: string) {
-    fieldRows[tabId] = [...(fieldRows[tabId] ?? []), { _id: uid(), name: '', type: 'string', required: false, indexed: false, enum: '' }]
+    fieldRows[tabId] = [...(fieldRows[tabId] ?? []), { _id: uid(), name: '', type: 'string', geometryType: 'point', required: false, indexed: false, enum: '' }]
     selectedFieldId[tabId] = fieldRows[tabId][fieldRows[tabId].length - 1]._id
   }
 
@@ -164,6 +194,98 @@
       }
     } catch (err) {
       error = err instanceof Error ? err.message : 'Query failed'
+    }
+  }
+
+  function initNewRecordForm(tabId: string) {
+    newRecordForms[tabId] = { id: '', lat: '', lon: '', validFrom: '', validUntil: '', labels: '', fields: {} }
+  }
+
+  function generateId(): string {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+  }
+
+  function displayStoredValue(v: StoredValue | undefined): string {
+    if (!v) return '—'
+    switch (v.type) {
+      case 'string': return v.string ?? '—'
+      case 'int': return v.int != null ? String(v.int) : '—'
+      case 'float': return v.float != null ? String(v.float) : '—'
+      case 'bool': return v.bool != null ? String(v.bool) : '—'
+      case 'datetime': return v.datetime ? v.datetime.replace('T', ' ').replace('Z', '') : '—'
+      case 'geometry': return v.point ? `${v.point.lat.toFixed(5)}, ${v.point.lon.toFixed(5)}` : '—'
+      default: return '—'
+    }
+  }
+
+  function storeSchema(storeName: string): RecordSchema | undefined {
+    return stores.find(s => s.config.name === storeName)?.config.schema
+  }
+
+  function schemaFields(storeName: string): Array<[string, FieldSchema]> {
+    const s = storeSchema(storeName)
+    if (!s?.fields) return []
+    return Object.entries(s.fields)
+  }
+
+  async function runBrowseQuery(tab: WorkspaceTab) {
+    const p = browseParams[tab.id]
+    try {
+      browseResults = {
+        ...browseResults,
+        [tab.id]: await client.query(tab.storeName, {
+          near: { lat: p.lat, lon: p.lon, radius: p.radius },
+          labels: p.labels.split(',').map(v => v.trim()).filter(Boolean),
+          valid_at: p.validAt || undefined,
+          limit: p.limit
+        })
+      }
+    } catch (err) {
+      insertError[tab.id] = err instanceof Error ? err.message : 'Query failed'
+    }
+  }
+
+  async function submitRecord(tab: WorkspaceTab) {
+    const form = newRecordForms[tab.id]
+    if (!form) return
+    insertError[tab.id] = ''
+    inserting[tab.id] = true
+    try {
+      const schema = storeSchema(tab.storeName)
+      const fields: Record<string, unknown> = {}
+      if (schema?.fields) {
+        for (const [name, field] of Object.entries(schema.fields)) {
+          if (field.type === 'geometry') {
+            const lat = parseFloat(form.fields[`${name}__lat`] ?? '')
+            const lon = parseFloat(form.fields[`${name}__lon`] ?? '')
+            if (!isNaN(lat) && !isNaN(lon)) fields[name] = { lat, lon }
+          } else {
+            const raw = form.fields[name] ?? ''
+            if (!raw) continue
+            if (field.type === 'int') fields[name] = parseInt(raw)
+            else if (field.type === 'float') fields[name] = parseFloat(raw)
+            else if (field.type === 'bool') fields[name] = raw === 'true'
+            else fields[name] = raw
+          }
+        }
+      }
+      await client.insertRecord(tab.storeName, {
+        id: form.id || generateId(),
+        ...(form.lat && form.lon ? { lat: parseFloat(form.lat), lon: parseFloat(form.lon) } : {}),
+        ...(form.validFrom ? { valid_from: form.validFrom } : {}),
+        ...(form.validUntil ? { valid_until: form.validUntil } : {}),
+        labels: form.labels.split(',').map(v => v.trim()).filter(Boolean),
+        fields: Object.keys(fields).length ? fields : undefined
+      })
+      insertSuccess[tab.id] = 'Record inserted.'
+      setTimeout(() => { insertSuccess[tab.id] = '' }, 3000)
+      initNewRecordForm(tab.id)
+      await runBrowseQuery(tab)
+      browseSubview[tab.id] = 'records'
+    } catch (err) {
+      insertError[tab.id] = err instanceof Error ? err.message : 'Insert failed'
+    } finally {
+      inserting[tab.id] = false
     }
   }
 
@@ -210,6 +332,10 @@
   $: activeSelectedField = activeTab ? (activeRows.find(r => r._id === selectedFieldId[activeTab.id]) ?? null) : null
   $: activeQueryResponse = activeTab ? queryResults[activeTab.id] ?? null : null
   $: activeQueryParams = activeTab?.kind === 'query' ? queryParams[activeTab.id] : null
+  $: activeBrowseParams = activeTab?.kind === 'browse' ? browseParams[activeTab.id] : null
+  $: activeBrowseResults = activeTab?.kind === 'browse' ? (browseResults[activeTab.id] ?? null) : null
+  $: activeBrowseSubview = activeTab?.kind === 'browse' ? (browseSubview[activeTab.id] ?? 'records') : null
+  $: activeNewRecordForm = activeTab?.kind === 'browse' ? (newRecordForms[activeTab.id] ?? null) : null
 </script>
 
 <div class="shell">
@@ -271,6 +397,13 @@
                   <line x1="4" y1="4" x2="4" y2="11" stroke="currentColor" stroke-width="1"/>
                 </svg>
               </button>
+              <button class="coll-action-btn" title="Browse" on:click|stopPropagation={() => openTab(store, 'browse')}>
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+                  <line x1="1" y1="3" x2="11" y2="3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+                  <line x1="1" y1="6" x2="11" y2="6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+                  <line x1="1" y1="9" x2="11" y2="9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+                </svg>
+              </button>
               <button class="coll-action-btn" title="Query" on:click|stopPropagation={() => openTab(store, 'query')}>
                 <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
                   <circle cx="5" cy="5" r="3.5" stroke="currentColor" stroke-width="1.2" fill="none"/>
@@ -302,6 +435,12 @@
               <rect x="1" y="1" width="10" height="10" rx="1" stroke="currentColor" stroke-width="1.2" fill="none"/>
               <line x1="1" y1="4" x2="11" y2="4" stroke="currentColor" stroke-width="1"/>
               <line x1="4" y1="4" x2="4" y2="11" stroke="currentColor" stroke-width="1"/>
+            </svg>
+          {:else if tab.kind === 'browse'}
+            <svg width="11" height="11" viewBox="0 0 12 12" fill="currentColor" class="tab-icon">
+              <line x1="1" y1="3" x2="11" y2="3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+              <line x1="1" y1="6" x2="11" y2="6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+              <line x1="1" y1="9" x2="11" y2="9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
             </svg>
           {:else}
             <svg width="11" height="11" viewBox="0 0 12 12" fill="currentColor" class="tab-icon">
@@ -383,13 +522,18 @@
                       <option value="float">float</option>
                       <option value="bool">bool</option>
                       <option value="datetime">datetime</option>
+                      <option value="geometry">geometry</option>
                     </select>
                   </td>
                   <td class="col-check">
                     <input type="checkbox" class="cell-check" bind:checked={row.required} on:click|stopPropagation />
                   </td>
                   <td class="col-check">
-                    <input type="checkbox" class="cell-check" bind:checked={row.indexed} on:click|stopPropagation />
+                    {#if row.type === 'geometry'}
+                      <input type="checkbox" class="cell-check" checked disabled title="Geometry fields are always indexed" />
+                    {:else}
+                      <input type="checkbox" class="cell-check" bind:checked={row.indexed} on:click|stopPropagation />
+                    {/if}
                   </td>
                   <td class="col-del">
                     <button class="del-row" title="Remove field" on:click|stopPropagation={() => removeField(activeTab.id, row._id)}>×</button>
@@ -414,11 +558,26 @@
         <!-- DETAIL PANEL -->
         {#if activeSelectedField}
           <div class="detail-panel">
-            <div class="detail-row">
-              <label class="detail-label" for="enum-values">Enum Values</label>
-              <input id="enum-values" class="detail-input" placeholder="val1, val2, val3" bind:value={activeSelectedField.enum} />
-              <span class="detail-hint">Comma-separated allowed values (optional)</span>
-            </div>
+            {#if activeSelectedField.type === 'geometry'}
+              <div class="detail-row">
+                <label class="detail-label" for="geometry-type">Geometry Type</label>
+                <select id="geometry-type" class="detail-select" bind:value={activeSelectedField.geometryType}>
+                  <option value="point">point</option>
+                </select>
+                <span class="detail-hint">Spatial subtype (currently only point is supported)</span>
+              </div>
+            {:else if activeSelectedField.type === 'string'}
+              <div class="detail-row">
+                <label class="detail-label" for="enum-values">Enum Values</label>
+                <input id="enum-values" class="detail-input" placeholder="val1, val2, val3" bind:value={activeSelectedField.enum} />
+                <span class="detail-hint">Comma-separated allowed values (optional)</span>
+              </div>
+            {:else}
+              <div class="detail-row">
+                <span class="detail-label"></span>
+                <span class="detail-hint muted">No additional options for {activeSelectedField.type} fields.</span>
+              </div>
+            {/if}
           </div>
         {/if}
       </div>
@@ -508,6 +667,233 @@
                 <li>{step}</li>
               {/each}
             </ol>
+          </div>
+        {/if}
+      </div>
+
+    {:else if activeTab.kind === 'browse' && activeBrowseParams && activeNewRecordForm}
+      <!-- BROWSE TAB -->
+      {@const sFields = schemaFields(activeTab.storeName)}
+      <div class="browse-editor">
+        <div class="editor-toolbar">
+          <div class="editor-title">
+            <strong>{activeTab.storeName}</strong>
+            <span class="kind-badge">Browse</span>
+          </div>
+          <div class="browse-subview-tabs">
+            <button
+              class="subview-btn"
+              class:active={activeBrowseSubview === 'records'}
+              on:click={() => { browseSubview[activeTab.id] = 'records' }}
+            >Records</button>
+            <button
+              class="subview-btn"
+              class:active={activeBrowseSubview === 'add'}
+              on:click={() => { browseSubview[activeTab.id] = 'add' }}
+            >+ Add Record</button>
+          </div>
+        </div>
+
+        {#if activeBrowseSubview === 'records'}
+          <!-- QUERY FORM -->
+          <div class="browse-query-bar">
+            <div class="bq-group">
+              <label class="bq-label">
+                <span>Lat</span>
+                <input class="bq-input" type="number" bind:value={activeBrowseParams.lat} step="0.0001" />
+              </label>
+              <label class="bq-label">
+                <span>Lon</span>
+                <input class="bq-input" type="number" bind:value={activeBrowseParams.lon} step="0.0001" />
+              </label>
+              <label class="bq-label">
+                <span>Radius (m)</span>
+                <input class="bq-input" type="number" bind:value={activeBrowseParams.radius} step="100" />
+              </label>
+              <label class="bq-label">
+                <span>Labels</span>
+                <input class="bq-input" type="text" bind:value={activeBrowseParams.labels} placeholder="restaurant, cafe" />
+              </label>
+              <label class="bq-label">
+                <span>Valid At</span>
+                <input class="bq-input" type="text" bind:value={activeBrowseParams.validAt} placeholder="ISO date" />
+              </label>
+              <label class="bq-label">
+                <span>Limit</span>
+                <input class="bq-input" type="number" bind:value={activeBrowseParams.limit} min="1" style="width:60px" />
+              </label>
+            </div>
+            <button class="btn-primary" on:click={() => runBrowseQuery(activeTab)}>
+              <svg width="11" height="11" viewBox="0 0 12 12" fill="currentColor">
+                <polygon points="2,1 11,6 2,11" fill="currentColor"/>
+              </svg>
+              Run
+            </button>
+          </div>
+
+          {#if insertError[activeTab.id]}
+            <div class="notify error">{insertError[activeTab.id]}</div>
+          {/if}
+          {#if insertSuccess[activeTab.id]}
+            <div class="notify success">{insertSuccess[activeTab.id]}</div>
+          {/if}
+
+          <!-- RESULTS TABLE -->
+          <div class="browse-results">
+            {#if activeBrowseResults?.results?.length}
+              <table class="results-table">
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Distance</th>
+                    <th>Labels</th>
+                    {#each sFields as [name]}
+                      <th>{name}</th>
+                    {/each}
+                    <th>Created</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each activeBrowseResults.results as result}
+                    <tr>
+                      <td class="mono">{result.record.id}</td>
+                      <td>{Math.round(result.distance_meters)}m</td>
+                      <td>{result.record.labels?.join(', ') || '—'}</td>
+                      {#each sFields as [name]}
+                        <td>{displayStoredValue(result.record.fields?.[name])}</td>
+                      {/each}
+                      <td class="muted">{result.record.created_at ? result.record.created_at.slice(0,10) : '—'}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+              <div class="browse-footer">{activeBrowseResults.results.length} record{activeBrowseResults.results.length === 1 ? '' : 's'}</div>
+            {:else if activeBrowseResults}
+              <div class="browse-empty muted">No records found. Adjust the query or add records.</div>
+            {:else}
+              <div class="browse-empty muted">Run a query to browse records.</div>
+            {/if}
+          </div>
+
+        {:else}
+          <!-- ADD RECORD FORM -->
+          <div class="add-record-form">
+            {#if insertError[activeTab.id]}
+              <div class="form-error">{insertError[activeTab.id]}</div>
+            {/if}
+
+            <div class="form-section">
+              <div class="form-section-label">Identity</div>
+              <div class="form-row">
+                <label class="form-field" style="flex:1">
+                  <span class="form-label">ID</span>
+                  <div class="id-wrap">
+                    <input class="form-input" bind:value={activeNewRecordForm.id} placeholder="auto-generated if empty" />
+                    <button class="btn-ghost btn-sm" on:click={() => { activeNewRecordForm.id = generateId(); newRecordForms[activeTab.id] = activeNewRecordForm }}>Generate</button>
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            <div class="form-section">
+              <div class="form-section-label">Location <span class="form-hint">(top-level — optional if a geometry field is set)</span></div>
+              <div class="form-row">
+                <label class="form-field">
+                  <span class="form-label">Latitude</span>
+                  <input class="form-input" type="number" step="0.00001" bind:value={activeNewRecordForm.lat} placeholder="43.6501" />
+                </label>
+                <label class="form-field">
+                  <span class="form-label">Longitude</span>
+                  <input class="form-input" type="number" step="0.00001" bind:value={activeNewRecordForm.lon} placeholder="-79.3801" />
+                </label>
+              </div>
+            </div>
+
+            <div class="form-section">
+              <div class="form-section-label">Validity <span class="form-hint">(optional)</span></div>
+              <div class="form-row">
+                <label class="form-field">
+                  <span class="form-label">Valid From</span>
+                  <input class="form-input" type="text" bind:value={activeNewRecordForm.validFrom} placeholder="2026-01-01T00:00:00Z" />
+                </label>
+                <label class="form-field">
+                  <span class="form-label">Valid Until</span>
+                  <input class="form-input" type="text" bind:value={activeNewRecordForm.validUntil} placeholder="2026-12-31T23:59:59Z" />
+                </label>
+              </div>
+            </div>
+
+            <div class="form-section">
+              <div class="form-section-label">Labels <span class="form-hint">(comma-separated)</span></div>
+              <input class="form-input" bind:value={activeNewRecordForm.labels} placeholder="restaurant, cafe" />
+            </div>
+
+            {#if sFields.length > 0}
+              <div class="form-section">
+                <div class="form-section-label">Fields</div>
+                {#each sFields as [name, field]}
+                  <div class="form-field-row">
+                    <span class="form-field-name">{name}</span>
+                    <span class="form-field-type">{field.type}{field.geometry_type ? `/${field.geometry_type}` : ''}{field.required ? ' *' : ''}</span>
+                    {#if field.type === 'geometry'}
+                      <div class="geom-inputs">
+                        <input
+                          class="form-input geom-input"
+                          type="number" step="0.00001"
+                          placeholder="lat"
+                          value={activeNewRecordForm.fields[`${name}__lat`] ?? ''}
+                          on:input={(e) => { activeNewRecordForm.fields[`${name}__lat`] = e.currentTarget.value; newRecordForms[activeTab.id] = activeNewRecordForm }}
+                        />
+                        <input
+                          class="form-input geom-input"
+                          type="number" step="0.00001"
+                          placeholder="lon"
+                          value={activeNewRecordForm.fields[`${name}__lon`] ?? ''}
+                          on:input={(e) => { activeNewRecordForm.fields[`${name}__lon`] = e.currentTarget.value; newRecordForms[activeTab.id] = activeNewRecordForm }}
+                        />
+                      </div>
+                    {:else if field.type === 'bool'}
+                      <select
+                        class="form-input"
+                        value={activeNewRecordForm.fields[name] ?? ''}
+                        on:change={(e) => { activeNewRecordForm.fields[name] = e.currentTarget.value; newRecordForms[activeTab.id] = activeNewRecordForm }}
+                      >
+                        <option value="">—</option>
+                        <option value="true">true</option>
+                        <option value="false">false</option>
+                      </select>
+                    {:else if field.enum?.length}
+                      <select
+                        class="form-input"
+                        value={activeNewRecordForm.fields[name] ?? ''}
+                        on:change={(e) => { activeNewRecordForm.fields[name] = e.currentTarget.value; newRecordForms[activeTab.id] = activeNewRecordForm }}
+                      >
+                        <option value="">—</option>
+                        {#each field.enum as opt}
+                          <option value={opt}>{opt}</option>
+                        {/each}
+                      </select>
+                    {:else}
+                      <input
+                        class="form-input"
+                        type={field.type === 'int' || field.type === 'float' ? 'number' : 'text'}
+                        step={field.type === 'float' ? '0.001' : undefined}
+                        placeholder={field.type === 'datetime' ? '2026-01-01T00:00:00Z' : ''}
+                        value={activeNewRecordForm.fields[name] ?? ''}
+                        on:input={(e) => { activeNewRecordForm.fields[name] = e.currentTarget.value; newRecordForms[activeTab.id] = activeNewRecordForm }}
+                      />
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            {/if}
+
+            <div class="form-actions">
+              <button class="btn-ghost" on:click={() => { browseSubview[activeTab.id] = 'records' }}>Cancel</button>
+              <button class="btn-primary" disabled={inserting[activeTab.id]} on:click={() => submitRecord(activeTab)}>
+                {inserting[activeTab.id] ? 'Inserting…' : 'Insert Record'}
+              </button>
+            </div>
           </div>
         {/if}
       </div>
@@ -1038,8 +1424,7 @@
     text-align: right;
   }
 
-  .detail-input {
-    flex: 1;
+  .detail-input, .detail-select {
     background: #0d0f12;
     border: 1px solid #1e2228;
     border-radius: 5px;
@@ -1048,10 +1433,13 @@
     font-size: 12px;
     padding: 6px 10px;
     outline: none;
-    max-width: 400px;
   }
 
-  .detail-input:focus { border-color: #2d5a8e; }
+  .detail-input { flex: 1; max-width: 400px; }
+  .detail-select { min-width: 120px; cursor: pointer; }
+  .detail-select option { background: #111418; }
+
+  .detail-input:focus, .detail-select:focus { border-color: #2d5a8e; }
 
   .detail-hint {
     font-size: 11px;
@@ -1202,6 +1590,227 @@
   .muted { color: #4b5563; }
 
   .sidebar-btns { display: flex; gap: 2px; }
+
+  /* ── BROWSE ── */
+  .browse-editor {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .browse-subview-tabs {
+    display: flex;
+    gap: 4px;
+  }
+
+  .subview-btn {
+    background: transparent;
+    border: 1px solid #252b36;
+    color: #6b7280;
+    border-radius: 5px;
+    padding: 5px 12px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .subview-btn:hover { border-color: #3d4451; color: #9ca3af; }
+  .subview-btn.active { background: #1a3a5c; border-color: #2d5a8e; color: #90c8ff; }
+
+  .browse-query-bar {
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    padding: 10px 16px;
+    border-bottom: 1px solid #1e2228;
+    background: #111418;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+
+  .bq-group {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+  }
+
+  .bq-label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .bq-label span {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #4b5563;
+  }
+
+  .bq-input {
+    background: #0d0f12;
+    border: 1px solid #1e2228;
+    border-radius: 5px;
+    color: #d4d8de;
+    font: inherit;
+    font-size: 12px;
+    padding: 5px 8px;
+    outline: none;
+    width: 90px;
+  }
+
+  .bq-input:focus { border-color: #2d5a8e; }
+
+  .browse-results {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+  }
+
+  .browse-footer {
+    padding: 8px 14px;
+    font-size: 11px;
+    color: #4b5563;
+    border-top: 1px solid #1e2228;
+    background: #111418;
+  }
+
+  .browse-empty {
+    padding: 32px 16px;
+    font-size: 13px;
+    text-align: center;
+  }
+
+  /* ── ADD RECORD FORM ── */
+  .add-record-form {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .form-error {
+    background: rgba(239,68,68,0.1);
+    border: 1px solid rgba(239,68,68,0.25);
+    border-radius: 6px;
+    color: #f87171;
+    font-size: 12px;
+    padding: 8px 12px;
+  }
+
+  .form-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .form-section-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: #4b5563;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #1e2228;
+  }
+
+  .form-hint {
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+    color: #3d4451;
+  }
+
+  .form-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .form-field {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    flex: 1;
+    min-width: 160px;
+  }
+
+  .form-label {
+    font-size: 11px;
+    color: #6b7280;
+  }
+
+  .form-input {
+    background: #0d0f12;
+    border: 1px solid #1e2228;
+    border-radius: 5px;
+    color: #d4d8de;
+    font: inherit;
+    font-size: 12px;
+    padding: 7px 10px;
+    outline: none;
+    width: 100%;
+  }
+
+  .form-input:focus { border-color: #2d5a8e; }
+  .form-input option { background: #111418; }
+
+  .id-wrap {
+    display: flex;
+    gap: 6px;
+  }
+
+  .id-wrap .form-input { flex: 1; }
+
+  .btn-sm {
+    padding: 5px 10px;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  .form-field-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 0;
+    border-bottom: 1px solid #181c22;
+  }
+
+  .form-field-name {
+    font-size: 12.5px;
+    color: #c9ced6;
+    width: 160px;
+    flex-shrink: 0;
+  }
+
+  .form-field-type {
+    font-size: 11px;
+    color: #4b5563;
+    width: 100px;
+    flex-shrink: 0;
+  }
+
+  .form-field-row .form-input { flex: 1; max-width: 360px; }
+
+  .geom-inputs {
+    display: flex;
+    gap: 8px;
+    flex: 1;
+    max-width: 360px;
+  }
+
+  .geom-input { flex: 1; max-width: none; }
+
+  .form-actions {
+    display: flex;
+    gap: 10px;
+    padding-top: 8px;
+  }
 
   /* ── MODAL ── */
   .modal-backdrop {
